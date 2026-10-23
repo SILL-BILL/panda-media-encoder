@@ -1,9 +1,11 @@
-"""Bounded, synchronous worker API for a fixed ffprobe command family.
+"""Bounded worker API for fixed, separately validated probe and GIF requests.
 
-Not a general command runner. No invocation happens on import. Only probe.py's
-fixed AVI inspection request is supported in this phase; FFmpeg conversion is
-deliberately absent. Call from a worker, never from Tk's event loop.
+Not a general command runner. No invocation happens on import. Probe and GIF
+requests have independent executable/argv validators. Call from a worker,
+never from Tk's event loop. Unit tests mock ALL process creation.
 """
+
+from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass, field
@@ -15,8 +17,12 @@ from pathlib import Path, PureWindowsPath
 import subprocess
 import threading
 import time
+from typing import TYPE_CHECKING
 
 from .paths import PathValidationError, validate_input_path
+
+if TYPE_CHECKING:
+    from .gif_engine import FFmpegCommandPlan
 
 
 DEFAULT_FFPROBE = Path(r"C:\ffmpeg\bin\ffprobe.exe")
@@ -77,6 +83,8 @@ class ProbeCommand:
 
 @dataclass(frozen=True, slots=True)
 class ProcessResult:
+    """SUCCEEDED means process exit success, never validated media completion."""
+
     status: RunStatus
     returncode: int | None = None
     stdout: bytes = field(default=b"", repr=False)
@@ -85,11 +93,20 @@ class ProcessResult:
     stderr_truncated: bool = False
     elapsed: float = 0.0
     error_code: str | None = None
+    output_validation_required: bool = False
 
 
 def _validated_arguments(command: ProbeCommand) -> list[str]:
     if type(command) is not ProbeCommand:
-        raise CommandValidationError("only a typed ProbeCommand is accepted")
+        # Lazy import avoids the probe -> runner -> GIF -> probe import cycle.
+        from .gif_engine import FFmpegCommandPlan, GifPlanError, validate_gif_command
+
+        if type(command) is not FFmpegCommandPlan:
+            raise CommandValidationError("only typed probe or GIF commands are accepted")
+        try:
+            return validate_gif_command(command)
+        except GifPlanError:
+            raise CommandValidationError("GIF command validation failed") from None
     expected = PureWindowsPath(str(DEFAULT_FFPROBE))
     supplied = PureWindowsPath(str(command.executable))
     if not supplied.is_absolute() or str(supplied).casefold() != str(expected).casefold():
@@ -193,7 +210,7 @@ def _stop_and_reap(process, limits: RunLimits) -> tuple[bool, bool]:
         return False, True
 
 
-def run_process(command: ProbeCommand, *, limits: RunLimits = RunLimits(),
+def run_process(command: ProbeCommand | FFmpegCommandPlan, *, limits: RunLimits = RunLimits(),
                 cancel: threading.Event | None = None) -> ProcessResult:
     """Run a fixed typed request; no raw command API, logs, files or callbacks.
 
@@ -204,9 +221,11 @@ def run_process(command: ProbeCommand, *, limits: RunLimits = RunLimits(),
     if type(limits) is not RunLimits:
         raise CommandValidationError("limits must be RunLimits")
     arguments = _validated_arguments(command)
+    output_validation_required = type(command) is not ProbeCommand
     start = time.monotonic()
     if cancel is not None and cancel.is_set():
-        return ProcessResult(RunStatus.CANCELLED, elapsed=time.monotonic() - start)
+        return ProcessResult(RunStatus.CANCELLED, elapsed=time.monotonic() - start,
+                             output_validation_required=output_validation_required)
     try:
         process = subprocess.Popen(arguments, shell=False, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -214,7 +233,7 @@ def run_process(command: ProbeCommand, *, limits: RunLimits = RunLimits(),
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except OSError:
         return ProcessResult(RunStatus.START_FAILED, elapsed=time.monotonic() - start,
-                             error_code="start_failed")
+                             error_code="start_failed", output_validation_required=output_validation_required)
 
     stop = threading.Event()
     captures = [_Capture(process.stdout, limits.stdout_bytes, stop),
@@ -268,4 +287,5 @@ def run_process(command: ProbeCommand, *, limits: RunLimits = RunLimits(),
         status, process.returncode, bytes(captures[0].data), bytes(captures[1].data),
         captures[0].truncated, captures[1].truncated, time.monotonic() - start,
         None if status is RunStatus.SUCCEEDED else status.value,
+        output_validation_required=output_validation_required,
     )

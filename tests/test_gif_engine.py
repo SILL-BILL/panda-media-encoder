@@ -4,19 +4,21 @@ from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 import errno
 from fractions import Fraction
+import io
 import os
 from pathlib import Path
 import stat
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from panda_media_encoder.gif_engine import (
-    DEFAULT_FFMPEG, GifPlanError, GifPlanErrorCode, build_gif_plan, calculate_gif_geometry,
+    DEFAULT_FFMPEG, FFmpegCommandPlan, GifPass, GifPlanError, GifPlanErrorCode,
+    build_gif_plan, calculate_gif_geometry, validate_gif_command,
 )
 from panda_media_encoder.models import GifPreset, PaletteSettings
 from panda_media_encoder.probe import ProbeInfo, RotationInfo, VideoStreamInfo, parse_probe_json
-from panda_media_encoder.process_runner import CommandValidationError, run_process
+from panda_media_encoder.process_runner import CommandValidationError, RunStatus, run_process
 
 
 def preset():
@@ -72,7 +74,8 @@ class GifEngineTests(unittest.TestCase):
         path = Path(path)
         if path not in self.nodes:
             raise FileNotFoundError(errno.ENOENT, "virtual path does not exist")
-        return SimpleNamespace(st_mode=self.nodes[path], st_file_attributes=0)
+        return SimpleNamespace(st_mode=self.nodes[path], st_file_attributes=0,
+                               st_dev=1, st_ino=hash(str(path).casefold()))
 
     def fake_lstat(self, path):
         if path in self.links:
@@ -415,10 +418,129 @@ class GifEngineTests(unittest.TestCase):
         self.assertNotIn("-y", result.palette_command.as_argv())
         self.assertNotIn("synthetic", repr(result))
 
-    def test_gif_plan_cannot_be_sent_to_probe_only_runner(self):
+    def test_gif_plan_requires_prepared_job_before_runner_launch(self):
         result = self.plan()
         with self.assertRaises(CommandValidationError):
             run_process(result.palette_command)
+
+    def test_runner_accepts_both_passes_after_revalidation_without_real_launch(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        for command in (result.palette_command, result.gif_command):
+            if command.phase is GifPass.GIF:
+                self.add_node(result.palette_path)
+            child = Mock(returncode=0, stdout=io.BytesIO(b"progress=end\n"), stderr=io.BytesIO())
+            child.poll.return_value = 0
+            child.wait.return_value = 0
+            clock = SimpleNamespace(monotonic=Mock(return_value=0.0))
+            with self.subTest(phase=command.phase), patch("subprocess.Popen", return_value=child) as popen, \
+                    patch("panda_media_encoder.process_runner.time", clock):
+                process_result = run_process(command)
+                self.assertEqual(process_result.status, RunStatus.SUCCEEDED)
+                self.assertTrue(process_result.output_validation_required)
+                self.assertEqual(popen.call_args.args[0], command.as_argv())
+                self.assertFalse(popen.call_args.kwargs["shell"])
+                self.assertTrue(child.stdout.closed and child.stderr.closed)
+                child.wait.assert_called_once()
+                child.terminate.assert_not_called()
+                child.kill.assert_not_called()
+        self.assertNotIn(result.gif_path, self.nodes)  # exit 0 is not artifact validation
+
+    def test_forged_argv_or_pass_identity_is_rejected(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        self.add_node(result.palette_path)
+        for command in (
+            replace(result.gif_command, arguments=result.gif_command.arguments + ("-y",)),
+            replace(result.gif_command, phase=GifPass.PALETTE),
+            replace(result.gif_command, arguments=result.palette_command.arguments),
+            replace(result.gif_command, executable=Path(r"C:\ffmpeg\bin\ffprobe.exe")),
+            replace(result.gif_command, context=None),
+            replace(result.gif_command, phase="gif"),
+            replace(result.gif_command, arguments=list(result.gif_command.arguments)),
+            FFmpegCommandPlan(DEFAULT_FFMPEG, result.gif_command.arguments),
+        ):
+            with self.subTest(command=command), self.assertRaises(CommandValidationError):
+                run_process(command)
+        for guard in self.guards:
+            guard.assert_not_called()
+
+    def test_fixed_template_rejects_output_and_input_swaps(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        self.add_node(result.palette_path)
+        args = result.gif_command.arguments
+        for changed in (
+            args[:-1] + (str(result.palette_path),),
+            tuple(str(result.gif_path) if value == str(result.palette_path) else value for value in args),
+            tuple(str(result.palette_path) if value == str(self.source) else value for value in args),
+            args[:-1] + (str(self.root / "lab" / "output" / "final.gif"),),
+        ):
+            with self.subTest(arguments=changed), self.assertRaises(CommandValidationError):
+                run_process(replace(result.gif_command, arguments=changed))
+
+    def test_execution_revalidates_context_not_just_command_type(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        context = result.palette_command.context
+        for changed in (
+            replace(context, preset=replace(self.settings, allow_upscale=True)),
+            replace(context, probe=probe(sar=Fraction(2))),
+            replace(context, probe=probe(rotation=RotationInfo())),
+            replace(context, known_variable_resolution=True),
+            replace(context, job_id="../outside"),
+            replace(context, input_path=self.source.with_suffix(".mov")),
+            replace(context, repository_root=r"\\host\share"),
+        ):
+            with self.subTest(context=changed), self.assertRaises(CommandValidationError):
+                run_process(replace(result.palette_command, context=changed))
+
+    def test_palette_pass_rejects_existing_outputs_or_unrelated_job_data(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        baseline = dict(self.nodes)
+        for path in (result.palette_path, result.gif_path, self.job / "unrelated.dat"):
+            self.nodes = dict(baseline)
+            self.add_node(path)
+            with self.subTest(path=path), self.assertRaises(CommandValidationError):
+                run_process(result.palette_command)
+
+    def test_gif_pass_requires_regular_palette_and_absent_output(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        with self.assertRaises(CommandValidationError):
+            run_process(result.gif_command)
+        self.add_node(result.palette_path, directory=True)
+        with self.assertRaises(CommandValidationError):
+            run_process(result.gif_command)
+        self.add_node(result.palette_path)
+        self.add_node(result.gif_path)
+        with self.assertRaises(CommandValidationError):
+            run_process(result.gif_command)
+
+    def test_runtime_reparse_point_is_rejected_even_after_planning(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        self.links.add(self.job)
+        with self.assertRaises(CommandValidationError):
+            run_process(result.palette_command)
+
+    def test_palette_hardlinked_to_source_is_rejected(self):
+        result = self.plan()
+        self.add_node(self.job, directory=True)
+        self.add_node(result.palette_path)
+        with patch.object(Path, "samefile", return_value=True):
+            with self.assertRaises(CommandValidationError):
+                run_process(result.gif_command)
+
+    def test_complete_dataclass_forgery_is_still_revalidated(self):
+        result = self.plan()
+        forged = FFmpegCommandPlan(result.palette_command.executable,
+                                   result.palette_command.arguments + ("-y",),
+                                   GifPass.PALETTE, result.palette_command.context)
+        self.add_node(self.job, directory=True)
+        with self.assertRaises(GifPlanError):
+            validate_gif_command(forged)
 
     def test_planning_does_not_mutate_files_or_launch_anything(self):
         before = dict(self.nodes)

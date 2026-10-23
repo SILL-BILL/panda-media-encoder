@@ -3,7 +3,8 @@
 Only local filesystem metadata is inspected when building a plan. No media is
 opened, probed, transformed, reserved, moved or deleted. A plan is a snapshot:
 later execution must revalidate paths and reserve its own unique job directory.
-Existing process_runner intentionally cannot execute these command plans.
+The process runner revalidates each typed command immediately before execution;
+this planning module never starts a process or prepares its output directory.
 """
 
 from dataclasses import dataclass, field, fields
@@ -66,12 +67,31 @@ class GifGeometry:
     stream_index: int
 
 
+class GifPass(Enum):
+    PALETTE = "palette"
+    GIF = "gif"
+
+
+@dataclass(frozen=True, slots=True)
+class GifCommandContext:
+    """Planning observations, revalidated rather than treated as authority."""
+
+    input_path: Path = field(repr=False)
+    repository_root: Path = field(repr=False)
+    job_id: str
+    probe: ProbeInfo
+    preset: GifPreset
+    known_variable_resolution: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class FFmpegCommandPlan:
     """Immutable plan; as_argv returns a fresh list, never a shell string."""
 
     executable: Path = field(repr=False)
     arguments: tuple[str, ...] = field(repr=False)
+    phase: GifPass | None = None
+    context: GifCommandContext | None = field(default=None, repr=False)
 
     def as_argv(self) -> list[str]:
         return [str(self.executable), *self.arguments]
@@ -179,7 +199,8 @@ def _checked_executable(value: str | Path) -> Path:
     return executable
 
 
-def _temporary_paths(repository_root: str | Path, job_id: str) -> tuple[Path, Path, Path]:
+def _temporary_paths(repository_root: str | Path, job_id: str, *,
+                     phase: GifPass | None = None) -> tuple[Path, Path, Path]:
     if type(job_id) is not str or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", job_id):
         raise GifPlanError(GifPlanErrorCode.INVALID_JOB_ID, "job ID must be 1..64 safe lowercase ASCII characters")
     try:
@@ -195,11 +216,23 @@ def _temporary_paths(repository_root: str | Path, job_id: str) -> tuple[Path, Pa
         gif = _checked_path(job / "animation.gif", must_exist=False)
         if job.parent != temp or palette.parent != job or gif.parent != job:
             raise GifPlanError(GifPlanErrorCode.INVALID_PATH, "temporary outputs escape the approved job directory")
-        # Reuse of even an empty job directory is rejected. No reservation or
-        # filesystem mutation is attempted; execution needs exclusive mkdir.
-        if (job.exists() or palette.exists() or gif.exists()
-                or any(child.name.casefold() == job_id.casefold() for child in temp.iterdir())):
-            raise GifPlanError(GifPlanErrorCode.OUTPUT_COLLISION, "temporary job/output name already exists")
+        if phase is None:
+            # Planning reserves nothing and refuses reuse of any job directory.
+            if (job.exists() or palette.exists() or gif.exists()
+                    or any(child.name.casefold() == job_id.casefold() for child in temp.iterdir())):
+                raise GifPlanError(GifPlanErrorCode.OUTPUT_COLLISION, "temporary job/output name already exists")
+        else:
+            # A separately authorized coordinator must exclusively create the
+            # directory first. This validator never creates or cleans it.
+            if type(phase) is not GifPass or not job.is_dir():
+                raise GifPlanError(GifPlanErrorCode.INVALID_PATH, "execution requires a prepared local job directory")
+            names = {child.name.casefold() for child in job.iterdir()}
+            allowed = set() if phase is GifPass.PALETTE else {"palette.png"}
+            if names - allowed or gif.exists() or (phase is GifPass.PALETTE and palette.exists()):
+                raise GifPlanError(GifPlanErrorCode.OUTPUT_COLLISION, "temporary output exists or job contains unexpected files")
+            if phase is GifPass.GIF:
+                if validate_input_path(palette) != palette:
+                    raise GifPlanError(GifPlanErrorCode.INVALID_PATH, "palette resolved outside the job directory")
     except (PathValidationError, OSError, TypeError, ValueError) as exc:
         if isinstance(exc, GifPlanError):
             raise
@@ -230,7 +263,17 @@ def build_gif_plan(input_path: str | Path, probe: ProbeInfo, preset: GifPreset,
     job, palette, gif = _temporary_paths(repository_root, job_id)
     if source in (palette, gif):
         raise GifPlanError(GifPlanErrorCode.OUTPUT_COLLISION, "input and temporary output must differ")
+    context = GifCommandContext(source, job.parent.parent.parent, job_id, probe, settings,
+                                known_variable_resolution)
+    first, second = _command_plans(executable, geometry, context, palette, gif)
+    return GifPlan(geometry, first, second, job, palette, gif)
+
+
+def _command_plans(executable: Path, geometry: GifGeometry, context: GifCommandContext,
+                    palette: Path, gif: Path) -> tuple[FFmpegCommandPlan, FFmpegCommandPlan]:
+    """One fixed template shared by planning and execution-time validation."""
     preprocessing = (f"fps={geometry.fps},scale={geometry.width}:{geometry.height}:flags=lanczos,setsar=1")
+    source = context.input_path
     input_arguments = (*_GLOBAL_OPTIONS, *_INPUT_OPTIONS, "-i", str(source))
     palette_filter = f"[0:{geometry.stream_index}]{preprocessing},palettegen=stats_mode=full[palette]"
     gif_filter = (f"[0:{geometry.stream_index}]{preprocessing}[video];"
@@ -238,11 +281,51 @@ def build_gif_plan(input_path: str | Path, probe: ProbeInfo, preset: GifPreset,
     first = FFmpegCommandPlan(executable, (
         *input_arguments, "-filter_complex", palette_filter, "-map", "[palette]",
         *_OUTPUT_OPTIONS, "-frames:v", "1", "-c:v", "png", "-f", "image2", str(palette),
-    ))
+    ), GifPass.PALETTE, context)
     second = FFmpegCommandPlan(executable, (
         *input_arguments, "-protocol_whitelist", "file", "-format_whitelist", "image2",
         "-f", "image2", "-pattern_type", "none", "-i", str(palette),
         "-filter_complex", gif_filter, "-map", "[gif]", *_OUTPUT_OPTIONS,
-        "-c:v", "gif", "-loop", str(settings.loop), "-f", "gif", str(gif),
-    ))
-    return GifPlan(geometry, first, second, job, palette, gif)
+        "-c:v", "gif", "-loop", str(context.preset.loop), "-f", "gif", str(gif),
+    ), GifPass.GIF, context)
+    return first, second
+
+
+def validate_gif_command(command: FFmpegCommandPlan) -> list[str]:
+    """Revalidate observations, paths and the entire fixed argv before launch.
+
+    A typed dataclass, factory provenance or an old validation result alone is
+    NOT trusted. No user-provided argv or as_argv override is used for launch.
+    This is a filesystem snapshot, not an OS sandbox or an output reservation.
+    The palette's contents and final GIF still require separate validation.
+    """
+    if (type(command) is not FFmpegCommandPlan or type(command.phase) is not GifPass
+            or type(command.context) is not GifCommandContext
+            or type(command.arguments) is not tuple
+            or any(type(argument) is not str for argument in command.arguments)):
+        raise GifPlanError(GifPlanErrorCode.INVALID_PROBE, "expected a complete typed GIF command")
+    context = command.context
+    settings = _validated_preset(context.preset)
+    geometry = calculate_gif_geometry(context.probe, settings,
+                                     known_variable_resolution=context.known_variable_resolution)
+    executable = _checked_executable(command.executable)
+    try:
+        source = validate_input_path(context.input_path)
+        if source != context.input_path:
+            raise GifPlanError(GifPlanErrorCode.INVALID_PATH, "input changed since planning")
+        if source.suffix.lower() != ".avi":
+            raise GifPlanError(GifPlanErrorCode.UNSUPPORTED_FORMAT, "only AVI input is supported")
+        _job, palette, gif = _temporary_paths(context.repository_root, context.job_id, phase=command.phase)
+        if source in (palette, gif) or (command.phase is GifPass.GIF and source.samefile(palette)):
+            raise GifPlanError(GifPlanErrorCode.OUTPUT_COLLISION, "input and palette/output must be distinct")
+    except (PathValidationError, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, GifPlanError):
+            raise
+        raise GifPlanError(GifPlanErrorCode.INVALID_PATH, "GIF execution path validation failed") from None
+    expected_context = GifCommandContext(source, context.repository_root, context.job_id,
+                                         context.probe, settings, context.known_variable_resolution)
+    first, second = _command_plans(executable, geometry, expected_context, palette, gif)
+    expected = first if command.phase is GifPass.PALETTE else second
+    if command.arguments != expected.arguments:
+        raise GifPlanError(GifPlanErrorCode.INVALID_PROBE, "GIF arguments differ from the fixed pass template")
+    return expected.as_argv()

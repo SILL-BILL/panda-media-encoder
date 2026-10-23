@@ -1,6 +1,8 @@
 """All children and pipes are synthetic; no executable is ever started."""
 
 from dataclasses import replace
+from decimal import Decimal
+from fractions import Fraction
 import io
 from pathlib import Path
 import subprocess
@@ -16,6 +18,9 @@ from panda_media_encoder.process_runner import (
     _read_chunk,
 )
 from panda_media_encoder.paths import PathValidationError
+from panda_media_encoder.gif_engine import DEFAULT_FFMPEG, GifPass, build_gif_plan
+from panda_media_encoder.models import GifPreset, PaletteSettings
+from panda_media_encoder.probe import ProbeInfo, RotationInfo, VideoStreamInfo
 
 
 class TrackingPipe(io.BytesIO):
@@ -81,10 +86,38 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(any(thread.name.startswith("panda-probe-") for thread in threading.enumerate()))
         return result
 
+    def gif_command(self, phase=GifPass.PALETTE):
+        """Runner unit tests fake filesystem metadata; GIF tests cover paths."""
+        root = Path(r"C:\synthetic\repository")
+        job = root / "lab" / "temp" / "job_001"
+        self.enterContext(patch("panda_media_encoder.gif_engine.validate_input_path",
+                                side_effect=lambda value: Path(value)))
+        self.enterContext(patch("panda_media_encoder.gif_engine._temporary_paths",
+                                return_value=(job, job / "palette.png", job / "animation.gif")))
+        self.enterContext(patch.object(Path, "samefile", return_value=False))
+        self.gif_clock = SimpleNamespace(monotonic=Mock(return_value=0.0))
+        self.enterContext(patch("panda_media_encoder.process_runner.time", self.gif_clock))
+        settings = GifPreset(1, "gif_review", "GIF確認用", "gif", 640, 640, 10,
+                             True, False, PaletteSettings("full", "sierra2_4a"), 0)
+        stream = VideoStreamInfo(7, "mpeg4", 1920, 1080, Fraction(24), Fraction(1), None,
+                                 RotationInfo(Decimal(0)), Decimal(2), False)
+        info = ProbeInfo("avi", Decimal(2), (stream,), 7)
+        plan = build_gif_plan(self.source, info, settings, root, "job_001")
+        self.command = plan.palette_command if phase is GifPass.PALETTE else plan.gif_command
+        return self.command
+
+    def expire_gif_deadline(self, process):
+        def poll():
+            self.gif_clock.monotonic.return_value = self.limits.timeout + 1.0
+            return process.returncode
+
+        process.poll.side_effect = poll
+
     def test_normal_exit_and_exact_safe_popen_contract(self):
         result = self.execute()
         self.assertEqual(result.status, RunStatus.SUCCEEDED)
         self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.output_validation_required)
         args, kwargs = self.popen.call_args
         self.assertIs(type(args[0]), list)
         self.assertEqual(args[0], [str(DEFAULT_FFPROBE), *self.command.arguments])
@@ -342,6 +375,124 @@ class RunnerTests(unittest.TestCase):
                     RunLimits(**{field: value})
         with self.assertRaises(CommandValidationError):
             run_process(self.command, limits={})
+        self.popen.assert_not_called()
+
+    def test_gif_both_passes_use_exact_argv_and_ffmpeg_executable(self):
+        for phase in GifPass:
+            command = self.gif_command(phase)
+            result = self.execute()
+            self.assertEqual(result.status, RunStatus.SUCCEEDED)
+            self.assertTrue(result.output_validation_required)
+            args, options = self.popen.call_args
+            self.assertEqual(args[0], command.as_argv())
+            self.assertEqual(args[0][0], str(DEFAULT_FFMPEG))
+            self.assertFalse(options["shell"])
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            self.assertIn("-n", args[0])
+            self.assertIn("-nostdin", args[0])
+            self.assertNotIn("-y", args[0])
+
+    def test_gif_nonzero_exit_remains_failure(self):
+        self.gif_command()
+        result = self.execute(FakeProcess(code=9))
+        self.assertEqual((result.status, result.returncode), (RunStatus.FAILED, 9))
+        self.assertTrue(result.output_validation_required)
+
+    def test_gif_start_failure_retains_output_validation_requirement(self):
+        self.gif_command()
+        self.popen.side_effect = OSError("private filename")
+        result = run_process(self.command)
+        self.assertEqual(result.status, RunStatus.START_FAILED)
+        self.assertTrue(result.output_validation_required)
+        self.assertNotIn("private", repr(result))
+
+    def test_gif_cancel_is_deterministic_and_reaps(self):
+        self.gif_command()
+        process, cancel = FakeProcess(blocked=True), threading.Event()
+        original_wait = process._wait
+
+        def wait(timeout=None):
+            if not process.signalled:
+                self.assertFalse(cancel.is_set(), "runner must not ignore cancellation")
+                cancel.set()
+            return original_wait(timeout)
+
+        process.wait.side_effect = wait
+        result = self.execute(process, cancel=cancel)
+        self.assertEqual(result.status, RunStatus.CANCELLED)
+        self.assertTrue(result.output_validation_required)
+        process.terminate.assert_called_once()
+        process.kill.assert_not_called()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(process.returncode, -15)
+
+    def test_gif_pre_cancel_does_not_launch(self):
+        self.gif_command()
+        cancel = threading.Event()
+        cancel.set()
+        result = run_process(self.command, cancel=cancel)
+        self.assertEqual(result.status, RunStatus.CANCELLED)
+        self.assertTrue(result.output_validation_required)
+        self.popen.assert_not_called()
+
+    def test_gif_timeout_terminates_and_reaps(self):
+        self.gif_command()
+        process = FakeProcess(blocked=True)
+        self.expire_gif_deadline(process)
+        self.assertEqual(self.execute(process).status, RunStatus.TIMED_OUT)
+        process.terminate.assert_called_once()
+        process.kill.assert_not_called()
+        process.wait.assert_called_once_with(timeout=self.limits.terminate_timeout)
+        self.assertEqual(process.returncode, -15)
+
+    def test_gif_terminate_failure_still_kills_and_reaps(self):
+        self.gif_command()
+        process = FakeProcess(blocked=True, terminate_error=True)
+        self.expire_gif_deadline(process)
+        self.assertEqual(self.execute(process).status, RunStatus.TIMED_OUT)
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(process.returncode, -9)
+
+    def test_gif_cleanup_failure_never_becomes_success(self):
+        self.gif_command()
+        process = FakeProcess(blocked=True, resist=True, kill_error=True, never_exit=True)
+        self.expire_gif_deadline(process)
+        result = self.execute(process)
+        self.assertEqual(result.status, RunStatus.CLEANUP_FAILED)
+        self.assertTrue(result.output_validation_required)
+        process.kill.assert_called_once()
+
+    def test_gif_progress_and_stderr_are_drained_after_capture_limit(self):
+        self.gif_command(GifPass.GIF)
+        stdout = b"out_time_ms=123\nprogress=continue\n" * 1000
+        stderr = b"synthetic diagnostic\n" * 2000
+        process = FakeProcess(stdout=stdout, stderr=stderr)
+        self.limits = replace(self.limits, stdout_bytes=32, stderr_bytes=24)
+        result = self.execute(process)
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        self.assertTrue(result.output_validation_required)
+        self.assertEqual((len(result.stdout), len(result.stderr)), (32, 24))
+        self.assertTrue(result.stdout_truncated and result.stderr_truncated)
+        self.assertEqual((process.stdout.bytes_read, process.stderr.bytes_read), (len(stdout), len(stderr)))
+
+    def test_gif_progress_end_does_not_override_failure_exit(self):
+        self.gif_command()
+        result = self.execute(FakeProcess(code=1, stdout=b"progress=end\n"))
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertTrue(result.output_validation_required)
+
+    def test_gif_and_probe_cannot_swap_types_or_executables(self):
+        command = self.gif_command()
+        for altered in (
+            replace(command, executable=DEFAULT_FFPROBE),
+            replace(command, arguments=command.arguments + ("-y",)),
+            ProbeCommand(DEFAULT_FFPROBE, self.source, command.arguments),
+            ProbeCommand(DEFAULT_FFMPEG, self.source, command.arguments),
+            command.as_argv(),
+        ):
+            with self.subTest(altered=altered), self.assertRaises(CommandValidationError):
+                run_process(altered)
         self.popen.assert_not_called()
 
 
