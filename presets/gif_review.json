@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "gif_review",
+  "name": "GIF確認用",
+  "format": "gif",
+  "max_width": 640,
+  "max_height": 640,
+  "fps": 10,
+  "keep_aspect_ratio": true,
+  "allow_upscale": false,
+  "palette": {
+    "stats_mode": "full",
+    "dither": "sierra2_4a"
+  },
+  "loop": 0
+}

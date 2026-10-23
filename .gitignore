@@ -218,3 +218,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local production media, outputs, temporary data and logs
+/lab/**/*
+!/lab/input/
+!/lab/output/
+!/lab/temp/
+!/lab/logs/
+!/lab/input/.gitkeep
+!/lab/output/.gitkeep
+!/lab/temp/.gitkeep
+!/lab/logs/.gitkeep
+
+# Persistent local conversion history
+/history/*
+!/history/.gitkeep
+
+# Local environment variants
+.env.*
+!.env.example
