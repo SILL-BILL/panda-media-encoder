@@ -155,8 +155,10 @@ def _stream(probe: ProbeInfo, known_variable_resolution: bool) -> VideoStreamInf
         raise GifPlanError(GifPlanErrorCode.UNKNOWN_ROTATION, "rotation information is invalid or unknown")
     angles = (selected.rotation.tag_degrees, selected.rotation.display_matrix_degrees)
     known_angles = [angle for angle in angles if angle is not None]
-    if not known_angles or any(type(angle) is not Decimal or not angle.is_finite() for angle in known_angles):
-        raise GifPlanError(GifPlanErrorCode.UNKNOWN_ROTATION, "at least one explicit finite zero rotation is required")
+    # AVI with no rotation metadata keeps stored pixel orientation (-noautorotate).
+    # Absence is not proof of correct orientation; preserve both None values.
+    if any(type(angle) is not Decimal or not angle.is_finite() for angle in known_angles):
+        raise GifPlanError(GifPlanErrorCode.UNKNOWN_ROTATION, "explicit rotation values must be finite decimals")
     if len(known_angles) == 2 and known_angles[0] != known_angles[1]:
         raise GifPlanError(GifPlanErrorCode.CONFLICTING_ROTATION, "rotation fields disagree")
     if any(angle != 0 for angle in known_angles):
@@ -166,7 +168,7 @@ def _stream(probe: ProbeInfo, known_variable_resolution: bool) -> VideoStreamInf
 
 def calculate_gif_geometry(probe: ProbeInfo, preset: GifPreset, *,
                            known_variable_resolution: bool = False) -> GifGeometry:
-    """Pure calculation for explicit SAR=1 and explicit zero rotation.
+    """Pure calculation for AVI with SAR=1 and absent or explicit zero rotation.
 
     Use exact rational scale min(1, max_width/width, max_height/height), floor
     each scaled axis, then clamp to at least 1 pixel. Integer raster rounding

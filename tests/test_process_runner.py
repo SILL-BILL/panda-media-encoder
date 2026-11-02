@@ -377,6 +377,16 @@ class RunnerTests(unittest.TestCase):
             run_process(self.command, limits={})
         self.popen.assert_not_called()
 
+    def test_probe_rejects_alternate_side_data_selectors(self):
+        index = self.command.arguments.index("-show_entries") + 1
+        for selector in ("stream_side_data=side_data_type,rotation",
+                         "side_data=side_data_type,rotation"):
+            arguments = list(self.command.arguments)
+            arguments[index] = arguments[index].replace("stream_side_data_list", selector)
+            with self.subTest(selector=selector), self.assertRaises(CommandValidationError):
+                run_process(replace(self.command, arguments=tuple(arguments)))
+        self.popen.assert_not_called()
+
     def test_gif_both_passes_use_exact_argv_and_ffmpeg_executable(self):
         for phase in GifPass:
             command = self.gif_command(phase)

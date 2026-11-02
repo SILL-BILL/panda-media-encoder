@@ -187,6 +187,24 @@ class ProbeTests(unittest.TestCase):
             with self.subTest(data=data):
                 self.assert_error(ProbeErrorCode.UNKNOWN_FIELD, data)
 
+    def test_empty_programs_preserves_probe_info_and_missing_rotation(self):
+        expected = parse_probe_json(payload(document()))
+        info = parse_probe_json(payload({**document(), "programs": []}))
+        self.assertEqual(info, expected)
+        self.assertIsNone(info.video_streams[0].rotation.tag_degrees)
+        self.assertIsNone(info.video_streams[0].rotation.display_matrix_degrees)
+
+    def test_nonempty_or_invalid_programs_are_rejected(self):
+        for programs in ([{}], [0], None, {}, "", False, 0):
+            with self.subTest(programs=programs):
+                self.assert_error(ProbeErrorCode.INVALID_DATA, {**document(), "programs": programs})
+
+    def test_empty_programs_does_not_allow_other_unknown_fields(self):
+        for field in ("unexpected", "frames", "packets", "packets_and_frames"):
+            with self.subTest(field=field):
+                self.assert_error(ProbeErrorCode.UNKNOWN_FIELD,
+                                  {**document(), "programs": [], field: []})
+
     def test_invalid_structures(self):
         for data in ([], None, True, {}, {"streams": {}, "format": {}},
                      {**document(), "streams": [None]}, {**document(), "format": []},
@@ -209,10 +227,18 @@ class ProbeTests(unittest.TestCase):
 
     def test_malformed_json_duplicate_fields_and_constants(self):
         for raw in (b"", b"{", b"\xff", b'{"streams":[],"streams":[]}', b'{"x":NaN}',
-                    b"[" * 2000 + b"0" + b"]" * 2000, b'{"x":' + b"9" * 5000 + b"}"):
-            with self.subTest(raw=raw[:50]), self.assertRaises(ProbeError) as caught:
-                parse_probe_json(raw)
-            self.assertEqual(caught.exception.code, ProbeErrorCode.MALFORMED_JSON)
+                    b'{"x":' + b"9" * 5000 + b"}"):
+            with self.subTest(raw=raw[:50]):
+                with self.assertRaises(ProbeError) as caught:
+                    parse_probe_json(raw)
+                self.assertEqual(caught.exception.code, ProbeErrorCode.MALFORMED_JSON)
+        # Valid JSON may exceed parser depth limits or reach schema validation.
+        with self.subTest(case="deeply nested array"):
+            with self.assertRaises(ProbeError) as caught:
+                parse_probe_json(b"[" * 2000 + b"0" + b"]" * 2000)
+            self.assertIn(caught.exception.code, (
+                ProbeErrorCode.MALFORMED_JSON, ProbeErrorCode.INVALID_DATA,
+            ))
 
     def test_json_payload_type_and_byte_limits(self):
         with self.assertRaises(ProbeError) as caught:
@@ -237,6 +263,8 @@ class ProbeTests(unittest.TestCase):
         entries = command.arguments[command.arguments.index("-show_entries") + 1]
         self.assertNotIn("filename", entries)
         self.assertIn("stream_tags=rotate", entries)
+        self.assertIn("stream_side_data_list", entries.split(":"))
+        self.assertNotIn("side_data=", entries)
         self.popen.assert_not_called()
 
     def test_unsupported_extensions_never_invoke_runner(self):

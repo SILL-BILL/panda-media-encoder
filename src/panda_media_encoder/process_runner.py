@@ -30,7 +30,7 @@ PROBE_ENTRIES = (
     "stream=index,codec_type,codec_name,width,height,avg_frame_rate,"
     "sample_aspect_ratio,display_aspect_ratio,duration:"
     "stream_disposition=attached_pic:stream_tags=rotate:"
-    "stream_side_data=side_data_type,rotation:format=format_name,duration"
+    "stream_side_data_list:format=format_name,duration"
 )
 PROBE_OPTIONS = (
     "-v", "error", "-max_alloc", "67108864", "-probesize", "5000000",

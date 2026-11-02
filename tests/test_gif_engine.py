@@ -169,11 +169,35 @@ class GifEngineTests(unittest.TestCase):
                 self.assert_code(GifPlanErrorCode.INVALID_PROBE,
                                  lambda: calculate_gif_geometry(probe(dar=value), self.settings))
 
-    def test_absent_rotation_is_unknown_not_zero(self):
-        for value in (None, RotationInfo()):
+    def test_invalid_rotation_structure_is_rejected(self):
+        for value in (None, {}, (None, None)):
             with self.subTest(value=value):
                 self.assert_code(GifPlanErrorCode.UNKNOWN_ROTATION,
                                  lambda: calculate_gif_geometry(probe(rotation=value), self.settings))
+
+    def test_absent_avi_rotation_plans_stored_pixels_without_filling_metadata(self):
+        info = probe(320, 240, index=0, fps=Fraction(10), rotation=RotationInfo())
+        result = self.plan(probe=info)
+        self.assertEqual((result.geometry.width, result.geometry.height,
+                          result.geometry.fps, result.geometry.stream_index), (320, 240, 10, 0))
+        for command in (result.palette_command, result.gif_command):
+            self.assertIs(command.context.probe, info)
+            self.assertIsNone(command.context.probe.video_streams[0].rotation.tag_degrees)
+            self.assertIsNone(command.context.probe.video_streams[0].rotation.display_matrix_degrees)
+            args = command.arguments
+            self.assertIn("-n", args)
+            self.assertIn("-noautorotate", args)
+            filters = args[args.index("-filter_complex") + 1]
+            self.assertIn("[0:0]fps=10,scale=320:240:flags=lanczos,setsar=1", filters)
+            self.assertNotIn("transpose", filters)
+            self.assertNotIn("rotate=", filters)
+
+    def test_absent_rotation_does_not_enable_other_formats(self):
+        info = probe(rotation=RotationInfo())
+        for name in ("mov", "mp4", "matroska", "", None):
+            with self.subTest(format=name):
+                self.assert_code(GifPlanErrorCode.UNSUPPORTED_FORMAT,
+                                 lambda: self.plan(probe=replace(info, format_name=name)))
 
     def test_explicit_zero_tag_matrix_or_both_are_accepted(self):
         for rotation in (RotationInfo(Decimal(0)), RotationInfo(None, Decimal(0)),
@@ -192,9 +216,10 @@ class GifEngineTests(unittest.TestCase):
 
     def test_invalid_rotation_values_are_not_coerced(self):
         for value in (True, 0, 0.0, "0", Decimal("NaN"), Decimal("Infinity")):
-            with self.subTest(value=value):
-                self.assert_code(GifPlanErrorCode.UNKNOWN_ROTATION,
-                                 lambda: calculate_gif_geometry(probe(rotation=RotationInfo(value)), self.settings))
+            for rotation in (RotationInfo(value), RotationInfo(None, value)):
+                with self.subTest(rotation=rotation):
+                    self.assert_code(GifPlanErrorCode.UNKNOWN_ROTATION,
+                                     lambda: calculate_gif_geometry(probe(rotation=rotation), self.settings))
 
     def test_known_resolution_changes_are_rejected(self):
         self.assert_code(GifPlanErrorCode.VARIABLE_RESOLUTION,
@@ -486,7 +511,7 @@ class GifEngineTests(unittest.TestCase):
         for changed in (
             replace(context, preset=replace(self.settings, allow_upscale=True)),
             replace(context, probe=probe(sar=Fraction(2))),
-            replace(context, probe=probe(rotation=RotationInfo())),
+            replace(context, probe=probe(rotation=None)),
             replace(context, known_variable_resolution=True),
             replace(context, job_id="../outside"),
             replace(context, input_path=self.source.with_suffix(".mov")),

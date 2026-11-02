@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 import stat
 import tempfile
@@ -80,10 +79,16 @@ class PathTests(unittest.TestCase):
 
     def test_same_file_hardlink_is_rejected(self):
         target = self.output / "dummy_review.gif"
-        os.link(self.source, target)
-        with self.assertRaisesRegex(PathValidationError, "same file"):
-            plan_gif_output(self.source, self.root)
-        self.assertTrue(self.source.samefile(target))
+        target.write_bytes(b"existing dummy")
+        source_before = self.source.read_bytes()
+        target_before = target.read_bytes()
+        # Simulate shared identity without requiring hardlink privileges.
+        with patch.object(Path, "samefile", autospec=True, return_value=True) as samefile:
+            with self.assertRaisesRegex(PathValidationError, "same file"):
+                plan_gif_output(self.source, self.root)
+        samefile.assert_called_once_with(self.source, target)
+        self.assertEqual(self.source.read_bytes(), source_before)
+        self.assertEqual(target.read_bytes(), target_before)
 
     def test_input_directory_is_rejected(self):
         with self.assertRaisesRegex(PathValidationError, "regular file"):

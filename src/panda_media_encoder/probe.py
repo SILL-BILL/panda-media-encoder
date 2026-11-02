@@ -197,7 +197,10 @@ def parse_probe_json(payload: bytes, *, stdout_truncated: bool = False) -> Probe
         raise
     except (ValueError, RecursionError):
         raise ProbeError(ProbeErrorCode.MALFORMED_JSON, "ffprobe returned invalid UTF-8 JSON") from None
-    data = _object(data, {"streams", "format"}, "root", {"streams", "format"})
+    data = _object(data, {"streams", "format", "programs"}, "root", {"streams", "format"})
+    # Older ffprobe builds emit an empty programs array even when not requested.
+    if "programs" in data and (type(data["programs"]) is not list or data["programs"]):
+        raise ProbeError(ProbeErrorCode.INVALID_DATA, "programs: only an empty array is supported")
     format_info = _object(data["format"], {"format_name", "duration"}, "format", {"format_name"})
     if format_info["format_name"] != "avi":
         raise ProbeError(ProbeErrorCode.UNSUPPORTED_FORMAT, "reported format differs from forced AVI")
